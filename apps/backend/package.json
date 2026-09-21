@@ -1,0 +1,22 @@
+{
+  "name": "backend",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest",
+    "db": "*",
+    "commons": "*"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.245",
+    "@types/mongoose": "^5.11.97",
+    "@types/ws": "^8.18.1",
+    "mongoose": "^8.24.4",
+    "uuidv4": "^6.2.13",
+    "ws": "^8.21.3"
+  }
+}

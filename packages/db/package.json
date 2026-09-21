@@ -1,0 +1,21 @@
+{
+  "name": "db",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "exports": {
+    "./client": "./index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@types/mongoose": "^5.11.97",
+    "@types/node": "^26.2.0",
+    "bson": "7.2.0",
+    "mongoose": "^8.24.4"
+  }
+}
