@@ -36,3 +36,8 @@ yarn-error.log*
 # Misc
 .DS_Store
 *.pem
+
+# impeccable skill output
+.impeccable/
+DESIGN.md
+PRODUCT.md
