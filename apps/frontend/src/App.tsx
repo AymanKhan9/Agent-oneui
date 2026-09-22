@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   ModelOptions, PermissionModeOptions, ToolOptions,
-  type AttachmentMeta, type FileEntry, type McpServerConfig, type McpStatusEntry, type OutgoingMessageType, type Session, type ToolCall, type Workspace
+  type AgentDefinition, type AttachmentMeta, type ElicitationRequestPayload, type McpServerConfig, type McpStatusEntry, type OutgoingMessageType, type Session, type ToolCall, type UsageInfoPayload, type Workspace
 } from "commons/types";
 import { useSocket } from "./hooks/useSocket";
 import "./index.css";
@@ -27,7 +29,7 @@ const PERMISSION_MODE_LABELS: Record<(typeof PermissionModeOptions)[number], str
 
 // App-level commands this UI handles itself, intercepted before ever reaching
 // the agent — distinct from the agent's own discovered slash commands
-const LOCAL_COMMANDS = ["plugin"];
+const LOCAL_COMMANDS = ["plugin", "usage"];
 
 // mirrors the backend's own default (User.ts) so checkboxes show the right
 // state before a workspace has ever set its own enabledTools list
@@ -60,13 +62,11 @@ export function App() {
   const [streamingText, setStreamingText] = useState<Record<string, string>>({});
   const [streamingThinking, setStreamingThinking] = useState<Record<string, string>>({});
   const [toolProgress, setToolProgress] = useState<Record<string, ToolCall[]>>({});
-  // nonce forces the sidebar to re-open the add-plugin input even when /plugin
-  // is invoked twice for the same, already-expanded workspace
-  const [pluginManagerRequest, setPluginManagerRequest] = useState<{ workspaceId: string; nonce: number } | null>(null);
-  const [fileTree, setFileTree] = useState<Record<string, FileEntry[]>>({}); // key: `${workspaceId}:${subpath}`
   const [permissionRequests, setPermissionRequests] = useState<Record<string, PermissionRequest>>({}); // key: sessionId
   const [rewindResult, setRewindResult] = useState<Record<string, RewindResult>>({}); // key: sessionId
   const [mcpStatus, setMcpStatus] = useState<Record<string, McpStatusEntry[]>>({}); // key: sessionId
+  const [usageInfo, setUsageInfo] = useState<Record<string, UsageInfoPayload>>({}); // key: sessionId
+  const [elicitationRequests, setElicitationRequests] = useState<Record<string, ElicitationRequestPayload>>({}); // key: sessionId
 
   function clearPendingState(sessionId: string) {
     setPendingSessionIds((prev) => {
@@ -90,6 +90,11 @@ export function App() {
       return next;
     });
     setPermissionRequests((prev) => {
+      const next = { ...prev };
+      delete next[sessionId];
+      return next;
+    });
+    setElicitationRequests((prev) => {
       const next = { ...prev };
       delete next[sessionId];
       return next;
@@ -234,11 +239,6 @@ export function App() {
       setWorkspaces((prev) => prev.map((w) => (w.id === workspaceId ? { ...w, additionalDirectories } : w)));
       return;
     }
-    if (msg.type === "files-listed") {
-      const { workspaceId, subpath, entries } = msg.payload;
-      setFileTree((prev) => ({ ...prev, [`${workspaceId}:${subpath}`]: entries }));
-      return;
-    }
     if (msg.type === "permission-request") {
       const { sessionId, requestId, toolName, input, title } = msg.payload;
       setPermissionRequests((prev) => ({ ...prev, [sessionId]: { requestId, toolName, input, title } }));
@@ -252,6 +252,45 @@ export function App() {
     if (msg.type === "mcp-status") {
       const { sessionId, servers } = msg.payload;
       setMcpStatus((prev) => ({ ...prev, [sessionId]: servers }));
+      return;
+    }
+    if (msg.type === "usage-info") {
+      setUsageInfo((prev) => ({ ...prev, [msg.payload.sessionId]: msg.payload }));
+      return;
+    }
+    if (msg.type === "agents-updated") {
+      const { workspaceId, agents } = msg.payload;
+      setWorkspaces((prev) => prev.map((w) => (w.id === workspaceId ? { ...w, agents } : w)));
+      return;
+    }
+    if (msg.type === "fallback-model-updated") {
+      const { workspaceId, fallbackModel } = msg.payload;
+      setWorkspaces((prev) => prev.map((w) => (w.id === workspaceId ? { ...w, fallbackModel } : w)));
+      return;
+    }
+    if (msg.type === "system-prompt-updated") {
+      const { workspaceId, systemPromptAppend } = msg.payload;
+      setWorkspaces((prev) => prev.map((w) => (w.id === workspaceId ? { ...w, systemPromptAppend } : w)));
+      return;
+    }
+    if (msg.type === "elicitation-request") {
+      const { sessionId } = msg.payload;
+      setElicitationRequests((prev) => ({ ...prev, [sessionId]: msg.payload }));
+      return;
+    }
+    if (msg.type === "task-notification") {
+      const { sessionId, status, summary } = msg.payload;
+      const text = `Background task ${status}: ${summary}`;
+      setWorkspaces((prev) =>
+        prev.map((w) => ({
+          ...w,
+          sessions: w.sessions.map((s) =>
+            s.id === sessionId
+              ? { ...s, messages: [...s.messages, { role: "system" as const, payload: { text } }] }
+              : s
+          ),
+        }))
+      );
       return;
     }
     // "message-added" without a title: content is already shown optimistically, ack needs no action
@@ -280,13 +319,6 @@ export function App() {
     send({ type: "remove-plugin", payload: { workspaceId, path } });
   }
 
-  function openPluginManager(sessionId: string) {
-    const workspace = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
-    if (!workspace) return;
-    setExpandedWorkspaceId(workspace.id);
-    setPluginManagerRequest({ workspaceId: workspace.id, nonce: Date.now() });
-  }
-
   function updateTools(workspaceId: string, enabledTools: (typeof ToolOptions)[number][]) {
     send({ type: "update-tools", payload: { workspaceId, enabledTools } });
   }
@@ -311,10 +343,6 @@ export function App() {
     send({ type: "remove-mcp-server", payload: { workspaceId, name } });
   }
 
-  function listFiles(workspaceId: string, subpath?: string) {
-    send({ type: "list-files", payload: { workspaceId, subpath } });
-  }
-
   function interrupt(sessionId: string) {
     send({ type: "interrupt", payload: { sessionId } });
     clearPendingState(sessionId);
@@ -328,9 +356,42 @@ export function App() {
     send({ type: "get-mcp-status", payload: { sessionId } });
   }
 
+  function getUsage(sessionId: string) {
+    send({ type: "get-usage", payload: { sessionId } });
+  }
+
   function respondToPermission(sessionId: string, requestId: string, allow: boolean) {
     send({ type: "permission-response", payload: { requestId, allow } });
     setPermissionRequests((prev) => {
+      const next = { ...prev };
+      delete next[sessionId];
+      return next;
+    });
+  }
+
+  function addAgent(workspaceId: string, agent: AgentDefinition) {
+    send({ type: "add-agent", payload: { workspaceId, agent } });
+  }
+
+  function removeAgent(workspaceId: string, name: string) {
+    send({ type: "remove-agent", payload: { workspaceId, name } });
+  }
+
+  function updateFallbackModel(workspaceId: string, fallbackModel: string) {
+    send({ type: "update-fallback-model", payload: { workspaceId, fallbackModel } });
+  }
+
+  function updateSystemPrompt(workspaceId: string, systemPromptAppend: string) {
+    send({ type: "update-system-prompt", payload: { workspaceId, systemPromptAppend } });
+  }
+
+  function backgroundTask(sessionId: string, toolUseId?: string) {
+    send({ type: "background-task", payload: { sessionId, toolUseId } });
+  }
+
+  function respondToElicitation(sessionId: string, requestId: string, action: "accept" | "decline" | "cancel", content?: Record<string, string>) {
+    send({ type: "elicitation-response", payload: { requestId, action, content } });
+    setElicitationRequests((prev) => {
       const next = { ...prev };
       delete next[sessionId];
       return next;
@@ -377,6 +438,7 @@ export function App() {
   const activeSession = workspaces
     .flatMap((w) => w.sessions)
     .find((s) => s.id === activeSessionId) ?? null;
+  const activeWorkspace = workspaces.find((w) => w.sessions.some((s) => s.id === activeSessionId)) ?? null;
 
   if (!connected) {
     return (
@@ -405,35 +467,41 @@ export function App() {
           onCreateWorkspace={createWorkspace}
           onCreateSession={createSession}
           onSelectSession={setActiveSessionId}
-          onAddPlugin={addPlugin}
-          onRemovePlugin={removePlugin}
-          pluginManagerRequest={pluginManagerRequest}
-          onUpdateTools={updateTools}
-          onAddMcpServer={addMcpServer}
-          onRemoveMcpServer={removeMcpServer}
-          onListFiles={listFiles}
-          fileTree={fileTree}
-          onGetMcpStatus={getMcpStatus}
-          mcpStatus={activeSessionId ? mcpStatus[activeSessionId] : undefined}
-          onUpdateSandbox={updateSandbox}
-          onAddDirectory={addDirectory}
-          onRemoveDirectory={removeDirectory}
           dark={dark}
           onToggleDark={() => setDark((d) => !d)}
         />
         <ChatWindow
           session={activeSession}
+          workspace={activeWorkspace}
           onSend={sendChatMessage}
           pending={activeSession ? pendingSessionIds.has(activeSession.id) : false}
           streamingText={activeSession ? streamingText[activeSession.id] : undefined}
           streamingThinking={activeSession ? streamingThinking[activeSession.id] : undefined}
           toolProgress={activeSession ? toolProgress[activeSession.id] : undefined}
-          onOpenPluginManager={openPluginManager}
           onInterrupt={interrupt}
           permissionRequest={activeSession ? permissionRequests[activeSession.id] : undefined}
           onRespondToPermission={respondToPermission}
           onRewindFiles={rewindFiles}
           rewindResult={activeSession ? rewindResult[activeSession.id] : undefined}
+          onBackgroundTask={backgroundTask}
+          elicitationRequest={activeSession ? elicitationRequests[activeSession.id] : undefined}
+          onRespondToElicitation={respondToElicitation}
+          onAddPlugin={addPlugin}
+          onRemovePlugin={removePlugin}
+          onUpdateTools={updateTools}
+          onUpdateSandbox={updateSandbox}
+          onAddDirectory={addDirectory}
+          onRemoveDirectory={removeDirectory}
+          onAddAgent={addAgent}
+          onRemoveAgent={removeAgent}
+          onUpdateFallbackModel={updateFallbackModel}
+          onUpdateSystemPrompt={updateSystemPrompt}
+          onAddMcpServer={addMcpServer}
+          onRemoveMcpServer={removeMcpServer}
+          onGetMcpStatus={getMcpStatus}
+          mcpStatus={activeSessionId ? mcpStatus[activeSessionId] : undefined}
+          onGetUsage={getUsage}
+          usageInfo={activeSessionId ? usageInfo[activeSessionId] : undefined}
         />
       </div>
     </div>
@@ -469,6 +537,145 @@ function StopIcon() {
     <svg viewBox="0 0 16 16" width="12" height="12" className="shrink-0 fill-current">
       <rect x="2" y="2" width="12" height="12" rx="2" />
     </svg>
+  );
+}
+
+// Small ring, fills as context fills — click sends `/compact` the same way
+// typing it would. Replaces the "N% context" header text.
+function ContextRing({ percentage, onClick }: { percentage: number; onClick: () => void }) {
+  const clamped = Math.min(100, Math.max(0, percentage));
+  const radius = 7;
+  const circumference = 2 * Math.PI * radius;
+  const offset = circumference * (1 - clamped / 100);
+  const color = clamped >= 80 ? "text-destructive" : clamped >= 50 ? "text-yellow-500" : "text-muted-foreground";
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={`${Math.round(clamped)}% context used — click to compact`}
+      className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full hover:bg-accent hover:text-accent-foreground ${color}`}
+    >
+      <svg viewBox="0 0 18 18" width="16" height="16" className="-rotate-90">
+        <circle cx="9" cy="9" r={radius} strokeWidth="2" fill="none" className="stroke-border" />
+        <circle
+          cx="9"
+          cy="9"
+          r={radius}
+          strokeWidth="2"
+          fill="none"
+          strokeDasharray={circumference}
+          strokeDashoffset={offset}
+          strokeLinecap="round"
+          className="stroke-current"
+        />
+      </svg>
+    </button>
+  );
+}
+
+function formatResetsIn(resetsAt: string | null | undefined): string {
+  if (!resetsAt) return "";
+  const ms = new Date(resetsAt).getTime() - Date.now();
+  if (ms <= 0) return "soon";
+  const hours = ms / 3600000;
+  if (hours < 1) return `${Math.round(ms / 60000)}m`;
+  if (hours < 48) return `${Math.round(hours)}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+
+function UsageBar({
+  label,
+  utilization,
+  resetsAt,
+}: {
+  label: string;
+  utilization: number | null | undefined;
+  resetsAt: string | null | undefined;
+}) {
+  const pct = Math.min(100, Math.max(0, utilization ?? 0));
+  return (
+    <div className="mb-3 last:mb-0">
+      <div className="mb-1 flex items-center justify-between">
+        <span className="font-mono text-xs text-foreground">{label}</span>
+        <span className="font-mono text-xs text-muted-foreground">{utilization != null ? `${Math.round(utilization)}%` : "—"}</span>
+      </div>
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+        <div className="h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
+      </div>
+      {resetsAt && <p className="mt-1 font-mono text-xs text-muted-foreground">Resets in {formatResetsIn(resetsAt)}</p>}
+    </div>
+  );
+}
+
+// mirrors Claude Code's own "Account & Usage" dialog — pulled from the SDK's
+// experimental usage/account control requests, hence the possible-undefined
+// fields (rate-limit windows are absent for API-key sessions, etc.)
+function UsageModal({ usage, onClose }: { usage: UsageInfoPayload | undefined; onClose: () => void }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={onClose}>
+      <div
+        className="w-full max-w-sm rounded-lg border border-border bg-popover p-4 shadow-lg"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-foreground">Account &amp; Usage</h2>
+          <button type="button" onClick={onClose} aria-label="Close" className="text-muted-foreground hover:text-foreground">
+            ×
+          </button>
+        </div>
+
+        {!usage ? (
+          <p className="font-mono text-xs text-muted-foreground">Loading…</p>
+        ) : usage.error ? (
+          <p className="font-mono text-xs text-muted-foreground">{usage.error}</p>
+        ) : (
+          <>
+            {usage.account && (
+              <div className="mb-4">
+                <p className="mb-1 font-mono text-xs tracking-wide text-muted-foreground uppercase">Account</p>
+                <div className="space-y-0.5 font-mono text-xs">
+                  {usage.account.tokenSource && (
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted-foreground">Auth method</span>
+                      <span className="min-w-0 truncate text-foreground">{usage.account.tokenSource}</span>
+                    </div>
+                  )}
+                  {usage.account.email && (
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted-foreground">Email</span>
+                      <span className="min-w-0 truncate text-foreground">{usage.account.email}</span>
+                    </div>
+                  )}
+                  {usage.account.organization && (
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted-foreground">Organization</span>
+                      <span className="min-w-0 truncate text-foreground">{usage.account.organization}</span>
+                    </div>
+                  )}
+                  {usage.account.subscriptionType && (
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted-foreground">Plan</span>
+                      <span className="min-w-0 truncate text-foreground">{usage.account.subscriptionType}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            <div>
+              <p className="mb-1 font-mono text-xs tracking-wide text-muted-foreground uppercase">Usage</p>
+              {usage.fiveHour && <UsageBar label="Session (5hr)" utilization={usage.fiveHour.utilization} resetsAt={usage.fiveHour.resetsAt} />}
+              {usage.sevenDay && <UsageBar label="Weekly (7 day)" utilization={usage.sevenDay.utilization} resetsAt={usage.sevenDay.resetsAt} />}
+              {!usage.fiveHour && !usage.sevenDay && (
+                <p className="font-mono text-xs text-muted-foreground">
+                  {usage.totalCostUsd !== undefined ? `Session cost: $${usage.totalCostUsd.toFixed(4)}` : "No rate-limit data available for this account."}
+                </p>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -540,19 +747,6 @@ function Sidebar({
   onCreateWorkspace,
   onCreateSession,
   onSelectSession,
-  onAddPlugin,
-  onRemovePlugin,
-  pluginManagerRequest,
-  onUpdateTools,
-  onAddMcpServer,
-  onRemoveMcpServer,
-  onListFiles,
-  fileTree,
-  onGetMcpStatus,
-  mcpStatus,
-  onUpdateSandbox,
-  onAddDirectory,
-  onRemoveDirectory,
   dark,
   onToggleDark,
 }: {
@@ -563,38 +757,10 @@ function Sidebar({
   onCreateWorkspace: (path: string) => void;
   onCreateSession: (workspaceId: string) => void;
   onSelectSession: (id: string) => void;
-  onAddPlugin: (workspaceId: string, path: string) => void;
-  onRemovePlugin: (workspaceId: string, path: string) => void;
-  pluginManagerRequest: { workspaceId: string; nonce: number } | null;
-  onUpdateTools: (workspaceId: string, enabledTools: (typeof ToolOptions)[number][]) => void;
-  onAddMcpServer: (workspaceId: string, server: McpServerConfig) => void;
-  onRemoveMcpServer: (workspaceId: string, name: string) => void;
-  onListFiles: (workspaceId: string, subpath?: string) => void;
-  fileTree: Record<string, FileEntry[]>;
-  onUpdateSandbox: (workspaceId: string, sandboxed: boolean) => void;
-  onAddDirectory: (workspaceId: string, path: string) => void;
-  onRemoveDirectory: (workspaceId: string, path: string) => void;
-  onGetMcpStatus: (sessionId: string) => void;
-  mcpStatus: McpStatusEntry[] | undefined;
   dark: boolean;
   onToggleDark: () => void;
 }) {
   const [newPath, setNewPath] = useState("");
-  const [addingPluginFor, setAddingPluginFor] = useState<string | null>(null);
-  const [addingDirectoryFor, setAddingDirectoryFor] = useState<string | null>(null);
-  const [directoryDraft, setDirectoryDraft] = useState("");
-  const [pluginPathDraft, setPluginPathDraft] = useState("");
-  const [addingMcpFor, setAddingMcpFor] = useState<string | null>(null);
-  const [mcpDraft, setMcpDraft] = useState<{ name: string; type: McpServerConfig["type"]; target: string }>({
-    name: "",
-    type: "http",
-    target: "",
-  });
-  const [filesSubpath, setFilesSubpath] = useState<Record<string, string>>({});
-
-  useEffect(() => {
-    if (pluginManagerRequest) setAddingPluginFor(pluginManagerRequest.workspaceId);
-  }, [pluginManagerRequest]);
 
   return (
     <div className="flex w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground">
@@ -673,267 +839,6 @@ function Sidebar({
                     + New session
                   </button>
 
-                  <div className="mt-1 border-t border-sidebar-border pt-1">
-                    {(w.pluginPaths ?? []).map((p) => (
-                      <div key={p} className="flex items-center gap-1 rounded-md px-2 py-0.5 hover:bg-sidebar-accent">
-                        <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={p}>
-                          {p}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => onRemovePlugin(w.id, p)}
-                          className="shrink-0 text-muted-foreground hover:text-foreground"
-                          aria-label={`Remove plugin ${p}`}
-                        >
-                          ×
-                        </button>
-                      </div>
-                    ))}
-                    {addingPluginFor === w.id ? (
-                      <form
-                        className="flex gap-1 px-1 py-0.5"
-                        onSubmit={(e) => {
-                          e.preventDefault();
-                          if (!pluginPathDraft.trim()) return;
-                          onAddPlugin(w.id, pluginPathDraft.trim());
-                          setPluginPathDraft("");
-                          setAddingPluginFor(null);
-                        }}
-                      >
-                        <input
-                          autoFocus
-                          value={pluginPathDraft}
-                          onChange={(e) => setPluginPathDraft(e.target.value)}
-                          onBlur={() => { if (!pluginPathDraft.trim()) setAddingPluginFor(null); }}
-                          placeholder="/path/to/plugin"
-                          className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-1.5 py-0.5 font-mono text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                        />
-                      </form>
-                    ) : (
-                      <button
-                        onClick={() => setAddingPluginFor(w.id)}
-                        className="block w-full rounded-md px-2 py-1 text-left text-xs text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-                      >
-                        + Add plugin
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="mt-1 border-t border-sidebar-border pt-1">
-                    <p className="px-2 py-0.5 font-mono text-xs tracking-wide text-muted-foreground uppercase">Tools</p>
-                    <div className="flex flex-wrap gap-1 px-2 pb-1">
-                      {ToolOptions.map((t) => {
-                        const enabledSet = new Set(w.enabledTools?.length ? w.enabledTools : DEFAULT_ENABLED_TOOLS);
-                        const on = enabledSet.has(t);
-                        return (
-                          <button
-                            key={t}
-                            type="button"
-                            onClick={() => {
-                              const next = new Set(enabledSet);
-                              if (on) next.delete(t);
-                              else next.add(t);
-                              onUpdateTools(w.id, ToolOptions.filter((o) => next.has(o)));
-                            }}
-                            className={`rounded-full border px-1.5 py-0.5 font-mono text-xs ${
-                              on ? "border-primary text-primary" : "border-border text-muted-foreground"
-                            }`}
-                          >
-                            {t}
-                          </button>
-                        );
-                      })}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => onUpdateSandbox(w.id, !w.sandboxed)}
-                      className={`mx-2 mb-1 rounded-full border px-1.5 py-0.5 font-mono text-xs ${
-                        w.sandboxed ? "border-primary text-primary" : "border-border text-muted-foreground"
-                      }`}
-                      title="Run Bash in an OS-level sandbox that restricts filesystem/network access"
-                    >
-                      Sandboxed Bash
-                    </button>
-                  </div>
-
-                  <div className="mt-1 border-t border-sidebar-border pt-1">
-                    <p className="px-2 py-0.5 font-mono text-xs tracking-wide text-muted-foreground uppercase">Additional directories</p>
-                    {(w.additionalDirectories ?? []).map((p) => (
-                      <div key={p} className="flex items-center gap-1 rounded-md px-2 py-0.5 hover:bg-sidebar-accent">
-                        <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={p}>
-                          {p}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => onRemoveDirectory(w.id, p)}
-                          className="shrink-0 text-muted-foreground hover:text-foreground"
-                          aria-label={`Remove directory ${p}`}
-                        >
-                          ×
-                        </button>
-                      </div>
-                    ))}
-                    {addingDirectoryFor === w.id ? (
-                      <form
-                        className="flex gap-1 px-1 py-0.5"
-                        onSubmit={(e) => {
-                          e.preventDefault();
-                          if (!directoryDraft.trim()) return;
-                          onAddDirectory(w.id, directoryDraft.trim());
-                          setDirectoryDraft("");
-                          setAddingDirectoryFor(null);
-                        }}
-                      >
-                        <input
-                          autoFocus
-                          value={directoryDraft}
-                          onChange={(e) => setDirectoryDraft(e.target.value)}
-                          onBlur={() => { if (!directoryDraft.trim()) setAddingDirectoryFor(null); }}
-                          placeholder="/path/to/directory"
-                          className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-1.5 py-0.5 font-mono text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                        />
-                      </form>
-                    ) : (
-                      <button
-                        onClick={() => setAddingDirectoryFor(w.id)}
-                        className="block w-full rounded-md px-2 py-1 text-left text-xs text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-                      >
-                        + Add directory
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="mt-1 border-t border-sidebar-border pt-1">
-                    <div className="flex items-center justify-between px-2 py-0.5">
-                      <p className="font-mono text-xs tracking-wide text-muted-foreground uppercase">MCP servers</p>
-                      {activeSessionId && w.sessions.some((sess) => sess.id === activeSessionId) && (
-                        <button
-                          type="button"
-                          onClick={() => onGetMcpStatus(activeSessionId)}
-                          className="font-mono text-xs text-muted-foreground hover:text-foreground"
-                          title="Refresh live connection status"
-                        >
-                          ↻
-                        </button>
-                      )}
-                    </div>
-                    {(w.mcpServers ?? []).map((s) => {
-                      const status = mcpStatus?.find((st) => st.name === s.name);
-                      return (
-                        <div key={s.name} className="flex items-center gap-1 rounded-md px-2 py-0.5 hover:bg-sidebar-accent">
-                          {status && (
-                            <span
-                              className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${MCP_STATUS_COLOR[status.status]}`}
-                              title={status.error ?? status.status}
-                            />
-                          )}
-                          <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={s.url ?? s.command}>
-                            {s.name} <span className="text-muted-foreground/70">({s.type})</span>
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => onRemoveMcpServer(w.id, s.name)}
-                            className="shrink-0 text-muted-foreground hover:text-foreground"
-                            aria-label={`Remove MCP server ${s.name}`}
-                          >
-                            ×
-                          </button>
-                        </div>
-                      );
-                    })}
-                    {addingMcpFor === w.id ? (
-                      <form
-                        className="space-y-1 px-1 py-0.5"
-                        onSubmit={(e) => {
-                          e.preventDefault();
-                          if (!mcpDraft.name.trim() || !mcpDraft.target.trim()) return;
-                          const server: McpServerConfig =
-                            mcpDraft.type === "stdio"
-                              ? { name: mcpDraft.name.trim(), type: "stdio", ...splitCommand(mcpDraft.target.trim()) }
-                              : { name: mcpDraft.name.trim(), type: mcpDraft.type, url: mcpDraft.target.trim() };
-                          onAddMcpServer(w.id, server);
-                          setMcpDraft({ name: "", type: "http", target: "" });
-                          setAddingMcpFor(null);
-                        }}
-                      >
-                        <input
-                          autoFocus
-                          value={mcpDraft.name}
-                          onChange={(e) => setMcpDraft((d) => ({ ...d, name: e.target.value }))}
-                          placeholder="server name"
-                          className="w-full rounded-md border border-input bg-transparent px-1.5 py-0.5 font-mono text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                        />
-                        <div className="flex gap-1">
-                          {(["http", "sse", "stdio"] as const).map((t) => (
-                            <button
-                              key={t}
-                              type="button"
-                              onClick={() => setMcpDraft((d) => ({ ...d, type: t }))}
-                              className={`rounded-full border px-1.5 py-0.5 font-mono text-xs ${
-                                mcpDraft.type === t ? "border-primary text-primary" : "border-border text-muted-foreground"
-                              }`}
-                            >
-                              {t}
-                            </button>
-                          ))}
-                        </div>
-                        <input
-                          value={mcpDraft.target}
-                          onChange={(e) => setMcpDraft((d) => ({ ...d, target: e.target.value }))}
-                          onBlur={() => { if (!mcpDraft.name.trim() && !mcpDraft.target.trim()) setAddingMcpFor(null); }}
-                          placeholder={mcpDraft.type === "stdio" ? "command, e.g. npx -y @scope/server" : "https://..."}
-                          className="w-full rounded-md border border-input bg-transparent px-1.5 py-0.5 font-mono text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                        />
-                      </form>
-                    ) : (
-                      <button
-                        onClick={() => setAddingMcpFor(w.id)}
-                        className="block w-full rounded-md px-2 py-1 text-left text-xs text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-                      >
-                        + Add MCP server
-                      </button>
-                    )}
-                  </div>
-
-                  <details
-                    className="mt-1 border-t border-sidebar-border pt-1"
-                    onToggle={(e) => {
-                      if (e.currentTarget.open && !fileTree[`${w.id}:${filesSubpath[w.id] ?? ""}`]) onListFiles(w.id, filesSubpath[w.id]);
-                    }}
-                  >
-                    <summary className="cursor-pointer px-2 py-0.5 font-mono text-xs tracking-wide text-muted-foreground uppercase select-none">
-                      Files
-                    </summary>
-                    <div className="px-2 pb-1">
-                      {filesSubpath[w.id] && (
-                        <button
-                          onClick={() => {
-                            const parent = filesSubpath[w.id]!.split("/").slice(0, -1).join("/");
-                            setFilesSubpath((prev) => ({ ...prev, [w.id]: parent }));
-                            onListFiles(w.id, parent);
-                          }}
-                          className="block w-full truncate rounded px-1 py-0.5 text-left font-mono text-xs text-muted-foreground hover:bg-sidebar-accent hover:text-foreground"
-                        >
-                          ..
-                        </button>
-                      )}
-                      {(fileTree[`${w.id}:${filesSubpath[w.id] ?? ""}`] ?? []).map((entry) => (
-                        <button
-                          key={entry.name}
-                          onClick={() => {
-                            if (entry.type !== "dir") return;
-                            const next = filesSubpath[w.id] ? `${filesSubpath[w.id]}/${entry.name}` : entry.name;
-                            setFilesSubpath((prev) => ({ ...prev, [w.id]: next }));
-                            onListFiles(w.id, next);
-                          }}
-                          className="block w-full truncate rounded px-1 py-0.5 text-left font-mono text-xs text-muted-foreground hover:bg-sidebar-accent hover:text-foreground"
-                        >
-                          {entry.name}
-                          {entry.type === "dir" ? "/" : ""}
-                        </button>
-                      ))}
-                    </div>
-                  </details>
                 </div>
               )}
             </div>
@@ -1051,12 +956,605 @@ function PaperclipIcon() {
   );
 }
 
+// Renders assistant/thinking text as markdown — inline `code`, fenced blocks,
+// bold, lists, links, etc. — styled to match the existing theme instead of
+// react-markdown's unstyled defaults (which is what left backticks/asterisks
+// showing up as literal characters before this existed).
+function Markdown({ text, className }: { text: string; className?: string }) {
+  return (
+    <div className={`markdown-body ${className ?? ""}`}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          p: ({ children }) => <p className="mb-2 whitespace-pre-wrap break-words last:mb-0">{children}</p>,
+          a: ({ children, href }) => (
+            <a href={href} target="_blank" rel="noreferrer" className="text-primary underline underline-offset-2">
+              {children}
+            </a>
+          ),
+          strong: ({ children }) => <strong className="font-semibold text-foreground">{children}</strong>,
+          ul: ({ children }) => <ul className="mb-2 list-disc space-y-0.5 pl-5 last:mb-0">{children}</ul>,
+          ol: ({ children }) => <ol className="mb-2 list-decimal space-y-0.5 pl-5 last:mb-0">{children}</ol>,
+          li: ({ children }) => <li className="pl-0.5">{children}</li>,
+          blockquote: ({ children }) => (
+            <blockquote className="mb-2 border-l-2 border-border pl-2 text-muted-foreground last:mb-0">{children}</blockquote>
+          ),
+          h1: ({ children }) => <p className="mb-1 font-semibold text-foreground">{children}</p>,
+          h2: ({ children }) => <p className="mb-1 font-semibold text-foreground">{children}</p>,
+          h3: ({ children }) => <p className="mb-1 font-semibold text-foreground">{children}</p>,
+          hr: () => <hr className="my-2 border-border" />,
+          code: ({ className, children }) => {
+            const isBlock = /language-/.test(className ?? "") || String(children).includes("\n");
+            if (!isBlock) {
+              return <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs text-foreground">{children}</code>;
+            }
+            return <code className="font-mono text-xs">{children}</code>;
+          },
+          pre: ({ children }) => (
+            <pre className="mb-2 overflow-x-auto rounded-md border border-border bg-muted/60 p-2 font-mono text-xs last:mb-0">
+              {children}
+            </pre>
+          ),
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function ThinkingBlock({ text }: { text: string }) {
   return (
     <details className="mb-1 rounded-md border border-border/60 bg-muted/40 px-2 py-1">
       <summary className="cursor-pointer select-none font-mono text-xs text-muted-foreground">Thinking</summary>
-      <p className="mt-1 whitespace-pre-wrap break-words text-xs text-muted-foreground">{text}</p>
+      <Markdown text={text} className="mt-1 text-xs text-muted-foreground" />
     </details>
+  );
+}
+
+// mode 'url': the server just needs an ack so its OAuth-style flow can proceed
+// in the opened tab. mode 'form' (or unset): one text input per JSON-Schema
+// property — a generic-but-correct form, not a full JSON Schema UI generator.
+function ElicitationCard({
+  request,
+  onRespond,
+}: {
+  request: ElicitationRequestPayload;
+  onRespond: (action: "accept" | "decline" | "cancel", content?: Record<string, string>) => void;
+}) {
+  const properties = (request.requestedSchema?.properties as Record<string, any> | undefined) ?? {};
+  const fieldNames = Object.keys(properties);
+  const [values, setValues] = useState<Record<string, string>>({});
+
+  return (
+    <div className="max-w-md rounded-md border border-primary/40 bg-muted p-2">
+      <p className="text-sm">{request.title ?? `${request.serverName} needs input`}</p>
+      <p className="mt-0.5 text-xs text-muted-foreground">{request.message}</p>
+      {request.mode === "url" && request.url && (
+        <a
+          href={request.url}
+          target="_blank"
+          rel="noreferrer"
+          className="mt-2 inline-block rounded-md bg-primary px-2 py-1 text-xs font-medium text-primary-foreground hover:opacity-90"
+        >
+          Open link ↗
+        </a>
+      )}
+      {request.mode !== "url" &&
+        fieldNames.map((key) => (
+          <input
+            key={key}
+            value={values[key] ?? ""}
+            onChange={(e) => setValues((v) => ({ ...v, [key]: e.target.value }))}
+            placeholder={key}
+            className="mt-1 w-full rounded-md border border-input bg-transparent px-1.5 py-0.5 font-mono text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          />
+        ))}
+      <div className="mt-2 flex gap-2">
+        <button
+          type="button"
+          onClick={() => onRespond("accept", request.mode === "url" ? undefined : values)}
+          className="rounded-md bg-primary px-2 py-1 text-xs font-medium text-primary-foreground hover:opacity-90"
+        >
+          {request.mode === "url" ? "Continue" : "Submit"}
+        </button>
+        <button
+          type="button"
+          onClick={() => onRespond("decline")}
+          className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground"
+        >
+          Decline
+        </button>
+      </div>
+    </div>
+  );
+}
+
+type ComposerPanel = "menu" | "plugins" | "tools" | "directories" | "agents" | "mcp" | "fallbackModel" | "systemPrompt";
+
+const WORKSPACE_MENU_ITEMS: { key: ComposerPanel; label: string }[] = [
+  { key: "plugins", label: "Plugins" },
+  { key: "tools", label: "Tools & sandbox" },
+  { key: "directories", label: "Additional directories" },
+  { key: "agents", label: "Subagents" },
+  { key: "mcp", label: "MCP servers" },
+  { key: "fallbackModel", label: "Fallback model" },
+  { key: "systemPrompt", label: "Instructions" },
+];
+
+// The composer's "+" menu — mirrors Claude Code's own attach/settings menu:
+// a flat list of workspace-level config, each item drilling into its own
+// panel with a back link, instead of a permanently-visible sidebar.
+function WorkspaceMenu({
+  workspace,
+  session,
+  open,
+  panel,
+  onOpenChange,
+  onPanelChange,
+  onAttach,
+  onRewindFiles,
+  pending,
+  onAddPlugin,
+  onRemovePlugin,
+  onUpdateTools,
+  onUpdateSandbox,
+  onAddDirectory,
+  onRemoveDirectory,
+  onAddAgent,
+  onRemoveAgent,
+  onUpdateFallbackModel,
+  onUpdateSystemPrompt,
+  onAddMcpServer,
+  onRemoveMcpServer,
+  onGetMcpStatus,
+  mcpStatus,
+}: {
+  workspace: Workspace | null;
+  session: Session | null;
+  open: boolean;
+  panel: ComposerPanel;
+  onOpenChange: (open: boolean) => void;
+  onPanelChange: (panel: ComposerPanel) => void;
+  onAttach: () => void;
+  onRewindFiles: (sessionId: string) => void;
+  pending: boolean;
+  onAddPlugin: (workspaceId: string, path: string) => void;
+  onRemovePlugin: (workspaceId: string, path: string) => void;
+  onUpdateTools: (workspaceId: string, enabledTools: (typeof ToolOptions)[number][]) => void;
+  onUpdateSandbox: (workspaceId: string, sandboxed: boolean) => void;
+  onAddDirectory: (workspaceId: string, path: string) => void;
+  onRemoveDirectory: (workspaceId: string, path: string) => void;
+  onAddAgent: (workspaceId: string, agent: AgentDefinition) => void;
+  onRemoveAgent: (workspaceId: string, name: string) => void;
+  onUpdateFallbackModel: (workspaceId: string, fallbackModel: string) => void;
+  onUpdateSystemPrompt: (workspaceId: string, systemPromptAppend: string) => void;
+  onAddMcpServer: (workspaceId: string, server: McpServerConfig) => void;
+  onRemoveMcpServer: (workspaceId: string, name: string) => void;
+  onGetMcpStatus: (sessionId: string) => void;
+  mcpStatus: McpStatusEntry[] | undefined;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [addingPlugin, setAddingPlugin] = useState(false);
+  const [pluginPathDraft, setPluginPathDraft] = useState("");
+  const [addingDirectory, setAddingDirectory] = useState(false);
+  const [directoryDraft, setDirectoryDraft] = useState("");
+  const [addingAgent, setAddingAgent] = useState(false);
+  const [agentDraft, setAgentDraft] = useState({ name: "", description: "", prompt: "" });
+  const [addingMcp, setAddingMcp] = useState(false);
+  const [mcpDraft, setMcpDraft] = useState<{ name: string; type: McpServerConfig["type"]; target: string }>({
+    name: "",
+    type: "http",
+    target: "",
+  });
+  const [systemPromptDraft, setSystemPromptDraft] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onDocClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) onOpenChange(false);
+    }
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [open, onOpenChange]);
+
+  function goToMenu() {
+    onPanelChange("menu");
+    setAddingPlugin(false);
+    setAddingDirectory(false);
+    setAddingAgent(false);
+    setAddingMcp(false);
+  }
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        onClick={() => {
+          if (open) { onOpenChange(false); return; }
+          onPanelChange("menu");
+          onOpenChange(true);
+        }}
+        disabled={pending}
+        title="Attachments and workspace settings"
+        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
+      >
+        <PlusIcon />
+      </button>
+      {open && (
+        <div className="absolute bottom-full left-0 z-20 mb-1 max-h-96 w-72 overflow-y-auto rounded-md border border-border bg-popover py-1 text-sm">
+          {panel === "menu" ? (
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  onAttach();
+                  onOpenChange(false);
+                }}
+                className="block w-full px-3 py-1.5 text-left font-mono text-xs text-foreground hover:bg-accent"
+              >
+                Attach file...
+              </button>
+              {session && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onRewindFiles(session.id);
+                    onOpenChange(false);
+                  }}
+                  title="Restore files to their state before your last message"
+                  className="block w-full px-3 py-1.5 text-left font-mono text-xs text-foreground hover:bg-accent"
+                >
+                  Rewind
+                </button>
+              )}
+              {!workspace ? (
+                <p className="px-3 py-1.5 font-mono text-xs text-muted-foreground">No workspace selected.</p>
+              ) : (
+                <>
+                  <div className="my-1 border-t border-border" />
+                  {WORKSPACE_MENU_ITEMS.map((item) => (
+                    <button
+                      key={item.key}
+                      type="button"
+                      onClick={() => onPanelChange(item.key)}
+                      className="block w-full px-3 py-1.5 text-left font-mono text-xs text-foreground hover:bg-accent"
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </>
+              )}
+            </>
+          ) : workspace ? (
+            <div>
+              <button
+                type="button"
+                onClick={goToMenu}
+                className="block w-full border-b border-border px-3 py-1.5 text-left font-mono text-xs text-muted-foreground hover:bg-accent"
+              >
+                ← Back
+              </button>
+              <div className="p-2">
+                {panel === "plugins" && (
+                  <>
+                    {(workspace.pluginPaths ?? []).map((p) => (
+                      <div key={p} className="flex items-center gap-1 rounded-md px-1 py-0.5 hover:bg-accent">
+                        <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={p}>
+                          {p}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => onRemovePlugin(workspace.id, p)}
+                          className="shrink-0 text-muted-foreground hover:text-foreground"
+                          aria-label={`Remove plugin ${p}`}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ))}
+                    {addingPlugin ? (
+                      <form
+                        className="flex gap-1 px-1 py-0.5"
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          if (!pluginPathDraft.trim()) return;
+                          onAddPlugin(workspace.id, pluginPathDraft.trim());
+                          setPluginPathDraft("");
+                          setAddingPlugin(false);
+                        }}
+                      >
+                        <input
+                          autoFocus
+                          value={pluginPathDraft}
+                          onChange={(e) => setPluginPathDraft(e.target.value)}
+                          onBlur={() => { if (!pluginPathDraft.trim()) setAddingPlugin(false); }}
+                          placeholder="/path/to/plugin"
+                          className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-1.5 py-0.5 font-mono text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        />
+                      </form>
+                    ) : (
+                      <button
+                        onClick={() => setAddingPlugin(true)}
+                        className="block w-full rounded-md px-1 py-1 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+                      >
+                        + Add plugin
+                      </button>
+                    )}
+                  </>
+                )}
+
+                {panel === "tools" && (
+                  <>
+                    <div className="flex flex-wrap gap-1 pb-1">
+                      {ToolOptions.map((t) => {
+                        const enabledSet = new Set(workspace.enabledTools?.length ? workspace.enabledTools : DEFAULT_ENABLED_TOOLS);
+                        const on = enabledSet.has(t);
+                        return (
+                          <button
+                            key={t}
+                            type="button"
+                            onClick={() => {
+                              const next = new Set(enabledSet);
+                              if (on) next.delete(t);
+                              else next.add(t);
+                              onUpdateTools(workspace.id, ToolOptions.filter((o) => next.has(o)));
+                            }}
+                            className={`rounded-full border px-1.5 py-0.5 font-mono text-xs ${
+                              on ? "border-primary text-primary" : "border-border text-muted-foreground"
+                            }`}
+                          >
+                            {t}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onUpdateSandbox(workspace.id, !workspace.sandboxed)}
+                      className={`rounded-full border px-1.5 py-0.5 font-mono text-xs ${
+                        workspace.sandboxed ? "border-primary text-primary" : "border-border text-muted-foreground"
+                      }`}
+                      title="Run Bash in an OS-level sandbox that restricts filesystem/network access"
+                    >
+                      Sandboxed Bash
+                    </button>
+                  </>
+                )}
+
+                {panel === "directories" && (
+                  <>
+                    {(workspace.additionalDirectories ?? []).map((p) => (
+                      <div key={p} className="flex items-center gap-1 rounded-md px-1 py-0.5 hover:bg-accent">
+                        <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={p}>
+                          {p}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => onRemoveDirectory(workspace.id, p)}
+                          className="shrink-0 text-muted-foreground hover:text-foreground"
+                          aria-label={`Remove directory ${p}`}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ))}
+                    {addingDirectory ? (
+                      <form
+                        className="flex gap-1 px-1 py-0.5"
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          if (!directoryDraft.trim()) return;
+                          onAddDirectory(workspace.id, directoryDraft.trim());
+                          setDirectoryDraft("");
+                          setAddingDirectory(false);
+                        }}
+                      >
+                        <input
+                          autoFocus
+                          value={directoryDraft}
+                          onChange={(e) => setDirectoryDraft(e.target.value)}
+                          onBlur={() => { if (!directoryDraft.trim()) setAddingDirectory(false); }}
+                          placeholder="/path/to/directory"
+                          className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-1.5 py-0.5 font-mono text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        />
+                      </form>
+                    ) : (
+                      <button
+                        onClick={() => setAddingDirectory(true)}
+                        className="block w-full rounded-md px-1 py-1 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+                      >
+                        + Add directory
+                      </button>
+                    )}
+                  </>
+                )}
+
+                {panel === "agents" && (
+                  <>
+                    {(workspace.agents ?? []).map((a) => (
+                      <div key={a.name} className="flex items-center gap-1 rounded-md px-1 py-0.5 hover:bg-accent">
+                        <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={a.description}>
+                          {a.name}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => onRemoveAgent(workspace.id, a.name)}
+                          className="shrink-0 text-muted-foreground hover:text-foreground"
+                          aria-label={`Remove agent ${a.name}`}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ))}
+                    {addingAgent ? (
+                      <form
+                        className="space-y-1 px-1 py-0.5"
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          if (!agentDraft.name.trim() || !agentDraft.description.trim() || !agentDraft.prompt.trim()) return;
+                          onAddAgent(workspace.id, { name: agentDraft.name.trim(), description: agentDraft.description.trim(), prompt: agentDraft.prompt.trim() });
+                          setAgentDraft({ name: "", description: "", prompt: "" });
+                          setAddingAgent(false);
+                        }}
+                      >
+                        <input
+                          autoFocus
+                          value={agentDraft.name}
+                          onChange={(e) => setAgentDraft((d) => ({ ...d, name: e.target.value }))}
+                          placeholder="agent name"
+                          className="w-full rounded-md border border-input bg-transparent px-1.5 py-0.5 font-mono text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        />
+                        <input
+                          value={agentDraft.description}
+                          onChange={(e) => setAgentDraft((d) => ({ ...d, description: e.target.value }))}
+                          placeholder="when to use it"
+                          className="w-full rounded-md border border-input bg-transparent px-1.5 py-0.5 font-mono text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        />
+                        <textarea
+                          value={agentDraft.prompt}
+                          onChange={(e) => setAgentDraft((d) => ({ ...d, prompt: e.target.value }))}
+                          placeholder="system prompt"
+                          rows={2}
+                          className="w-full resize-none rounded-md border border-input bg-transparent px-1.5 py-0.5 font-mono text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        />
+                        <button type="submit" className="w-full rounded-md border border-border px-1.5 py-0.5 text-xs text-muted-foreground hover:text-foreground">
+                          Save agent
+                        </button>
+                      </form>
+                    ) : (
+                      <button
+                        onClick={() => setAddingAgent(true)}
+                        className="block w-full rounded-md px-1 py-1 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+                      >
+                        + Add subagent
+                      </button>
+                    )}
+                  </>
+                )}
+
+                {panel === "mcp" && (
+                  <>
+                    {session && (
+                      <button
+                        type="button"
+                        onClick={() => onGetMcpStatus(session.id)}
+                        className="mb-1 font-mono text-xs text-muted-foreground hover:text-foreground"
+                        title="Refresh live connection status"
+                      >
+                        ↻ Refresh status
+                      </button>
+                    )}
+                    {(workspace.mcpServers ?? []).map((s) => {
+                      const status = mcpStatus?.find((st) => st.name === s.name);
+                      return (
+                        <div key={s.name} className="flex items-center gap-1 rounded-md px-1 py-0.5 hover:bg-accent">
+                          {status && (
+                            <span
+                              className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${MCP_STATUS_COLOR[status.status]}`}
+                              title={status.error ?? status.status}
+                            />
+                          )}
+                          <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={s.url ?? s.command}>
+                            {s.name} <span className="text-muted-foreground/70">({s.type})</span>
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => onRemoveMcpServer(workspace.id, s.name)}
+                            className="shrink-0 text-muted-foreground hover:text-foreground"
+                            aria-label={`Remove MCP server ${s.name}`}
+                          >
+                            ×
+                          </button>
+                        </div>
+                      );
+                    })}
+                    {addingMcp ? (
+                      <form
+                        className="space-y-1 px-1 py-0.5"
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          if (!mcpDraft.name.trim() || !mcpDraft.target.trim()) return;
+                          const server: McpServerConfig =
+                            mcpDraft.type === "stdio"
+                              ? { name: mcpDraft.name.trim(), type: "stdio", ...splitCommand(mcpDraft.target.trim()) }
+                              : { name: mcpDraft.name.trim(), type: mcpDraft.type, url: mcpDraft.target.trim() };
+                          onAddMcpServer(workspace.id, server);
+                          setMcpDraft({ name: "", type: "http", target: "" });
+                          setAddingMcp(false);
+                        }}
+                      >
+                        <input
+                          autoFocus
+                          value={mcpDraft.name}
+                          onChange={(e) => setMcpDraft((d) => ({ ...d, name: e.target.value }))}
+                          placeholder="server name"
+                          className="w-full rounded-md border border-input bg-transparent px-1.5 py-0.5 font-mono text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        />
+                        <div className="flex gap-1">
+                          {(["http", "sse", "stdio"] as const).map((t) => (
+                            <button
+                              key={t}
+                              type="button"
+                              onClick={() => setMcpDraft((d) => ({ ...d, type: t }))}
+                              className={`rounded-full border px-1.5 py-0.5 font-mono text-xs ${
+                                mcpDraft.type === t ? "border-primary text-primary" : "border-border text-muted-foreground"
+                              }`}
+                            >
+                              {t}
+                            </button>
+                          ))}
+                        </div>
+                        <input
+                          value={mcpDraft.target}
+                          onChange={(e) => setMcpDraft((d) => ({ ...d, target: e.target.value }))}
+                          onBlur={() => { if (!mcpDraft.name.trim() && !mcpDraft.target.trim()) setAddingMcp(false); }}
+                          placeholder={mcpDraft.type === "stdio" ? "command, e.g. npx -y @scope/server" : "https://..."}
+                          className="w-full rounded-md border border-input bg-transparent px-1.5 py-0.5 font-mono text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        />
+                      </form>
+                    ) : (
+                      <button
+                        onClick={() => setAddingMcp(true)}
+                        className="block w-full rounded-md px-1 py-1 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+                      >
+                        + Add MCP server
+                      </button>
+                    )}
+                  </>
+                )}
+
+                {panel === "fallbackModel" && (
+                  <select
+                    value={workspace.fallbackModel ?? ""}
+                    onChange={(e) => onUpdateFallbackModel(workspace.id, e.target.value)}
+                    className="w-full rounded-md border border-input bg-transparent px-1.5 py-0.5 font-mono text-xs text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  >
+                    <option value="">None</option>
+                    {ModelOptions.map((m) => (
+                      <option key={m} value={m}>{MODEL_LABELS[m]}</option>
+                    ))}
+                  </select>
+                )}
+
+                {panel === "systemPrompt" && (
+                  <textarea
+                    value={systemPromptDraft ?? workspace.systemPromptAppend ?? ""}
+                    onChange={(e) => setSystemPromptDraft(e.target.value)}
+                    onBlur={(e) => {
+                      if (e.target.value !== (workspace.systemPromptAppend ?? "")) onUpdateSystemPrompt(workspace.id, e.target.value);
+                    }}
+                    placeholder="Appended to the default system prompt"
+                    rows={3}
+                    className="w-full resize-none rounded-md border border-input bg-transparent px-1.5 py-0.5 font-mono text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  />
+                )}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1083,18 +1581,15 @@ function MessageRow({
 
   if (role === "user") {
     return (
-      <div className="mb-3 flex gap-2">
-        <span className="shrink-0 font-mono text-xs text-primary select-none">&gt;</span>
-        <div className="min-w-0 flex-1 space-y-1">
-          {attachments && attachments.length > 0 && (
-            <div className="flex flex-wrap gap-1">
-              {attachments.map((a, i) => (
-                <AttachmentChip key={i} name={a.name} />
-              ))}
-            </div>
-          )}
-          {text && <p className="whitespace-pre-wrap break-words text-sm">{text}</p>}
-        </div>
+      <div className="mb-3 rounded-lg border border-border bg-muted/40 px-3 py-2">
+        {attachments && attachments.length > 0 && (
+          <div className="mb-1 flex flex-wrap gap-1">
+            {attachments.map((a, i) => (
+              <AttachmentChip key={i} name={a.name} />
+            ))}
+          </div>
+        )}
+        {text && <p className="whitespace-pre-wrap break-words text-sm">{text}</p>}
       </div>
     );
   }
@@ -1111,7 +1606,7 @@ function MessageRow({
             ))}
           </div>
         )}
-        {text && <p className="whitespace-pre-wrap break-words text-sm">{text}</p>}
+        {text && <Markdown text={text} className="text-sm" />}
       </div>
     </div>
   );
@@ -1134,19 +1629,39 @@ function fileToBase64(file: File): Promise<string> {
 
 function ChatWindow({
   session,
+  workspace,
   onSend,
   pending,
   streamingText,
   streamingThinking,
   toolProgress,
-  onOpenPluginManager,
   onInterrupt,
   permissionRequest,
   onRespondToPermission,
   onRewindFiles,
   rewindResult,
+  onBackgroundTask,
+  elicitationRequest,
+  onRespondToElicitation,
+  onAddPlugin,
+  onRemovePlugin,
+  onUpdateTools,
+  onUpdateSandbox,
+  onAddDirectory,
+  onRemoveDirectory,
+  onAddAgent,
+  onRemoveAgent,
+  onUpdateFallbackModel,
+  onUpdateSystemPrompt,
+  onAddMcpServer,
+  onRemoveMcpServer,
+  onGetMcpStatus,
+  mcpStatus,
+  onGetUsage,
+  usageInfo,
 }: {
   session: Session | null;
+  workspace: Workspace | null;
   onSend: (
     sessionId: string,
     message: string,
@@ -1160,21 +1675,47 @@ function ChatWindow({
   streamingText: string | undefined;
   streamingThinking: string | undefined;
   toolProgress: ToolCall[] | undefined;
-  onOpenPluginManager: (sessionId: string) => void;
   onInterrupt: (sessionId: string) => void;
   permissionRequest: PermissionRequest | undefined;
   onRespondToPermission: (sessionId: string, requestId: string, allow: boolean) => void;
   onRewindFiles: (sessionId: string) => void;
   rewindResult: RewindResult | undefined;
+  onBackgroundTask: (sessionId: string, toolUseId?: string) => void;
+  elicitationRequest: ElicitationRequestPayload | undefined;
+  onRespondToElicitation: (sessionId: string, requestId: string, action: "accept" | "decline" | "cancel", content?: Record<string, string>) => void;
+  onAddPlugin: (workspaceId: string, path: string) => void;
+  onRemovePlugin: (workspaceId: string, path: string) => void;
+  onUpdateTools: (workspaceId: string, enabledTools: (typeof ToolOptions)[number][]) => void;
+  onUpdateSandbox: (workspaceId: string, sandboxed: boolean) => void;
+  onAddDirectory: (workspaceId: string, path: string) => void;
+  onRemoveDirectory: (workspaceId: string, path: string) => void;
+  onAddAgent: (workspaceId: string, agent: AgentDefinition) => void;
+  onRemoveAgent: (workspaceId: string, name: string) => void;
+  onUpdateFallbackModel: (workspaceId: string, fallbackModel: string) => void;
+  onUpdateSystemPrompt: (workspaceId: string, systemPromptAppend: string) => void;
+  onAddMcpServer: (workspaceId: string, server: McpServerConfig) => void;
+  onRemoveMcpServer: (workspaceId: string, name: string) => void;
+  onGetMcpStatus: (sessionId: string) => void;
+  mcpStatus: McpStatusEntry[] | undefined;
+  onGetUsage: (sessionId: string) => void;
+  usageInfo: UsageInfoPayload | undefined;
 }) {
   const [input, setInput] = useState("");
   const [model, setModel] = useState<(typeof ModelOptions)[number] | "">("");
   const [permissionMode, setPermissionMode] = useState<(typeof PermissionModeOptions)[number]>("acceptEdits");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [fileError, setFileError] = useState<string | null>(null);
+  const [composerOpen, setComposerOpen] = useState(false);
+  const [composerPanel, setComposerPanel] = useState<ComposerPanel>("menu");
+  const [usageModalOpen, setUsageModalOpen] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  function openComposerPanel(panel: ComposerPanel) {
+    setComposerPanel(panel);
+    setComposerOpen(true);
+  }
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: "end" });
@@ -1221,7 +1762,7 @@ function ChatWindow({
 
   const slashMatches =
     input.startsWith("/") && !input.includes(" ")
-      ? [...LOCAL_COMMANDS, ...(session.slashCommands ?? [])].filter((c) =>
+      ? [...new Set([...LOCAL_COMMANDS, ...(session.slashCommands ?? [])])].filter((c) =>
           c.toLowerCase().startsWith(input.slice(1).toLowerCase())
         )
       : [];
@@ -1229,8 +1770,12 @@ function ChatWindow({
 
   // returns true if `name` was one of ours and handled — never reaches the agent
   function runLocalCommand(name: string): boolean {
-    if (name !== "plugin") return false;
-    onOpenPluginManager(session!.id);
+    if (name !== "plugin" && name !== "usage") return false;
+    if (name === "plugin") openComposerPanel("plugins");
+    if (name === "usage") {
+      onGetUsage(session!.id);
+      setUsageModalOpen(true);
+    }
     setInput("");
     if (textareaRef.current) textareaRef.current.style.height = "auto";
     return true;
@@ -1251,32 +1796,18 @@ function ChatWindow({
     if (textareaRef.current) textareaRef.current.style.height = "auto";
   }
 
+  // same as typing /compact and hitting enter — the CLI's own built-in
+  // command handles it, we're just triggering it from the context ring
+  function runCompact() {
+    if (pending) return;
+    onSend(session!.id, "/compact", { model: model || undefined, permissionMode });
+  }
+
   return (
     <div className="flex min-w-0 flex-1 flex-col">
+      {usageModalOpen && <UsageModal usage={usageInfo} onClose={() => setUsageModalOpen(false)} />}
       <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border px-4 py-2">
         <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">{sessionLabel(session)}</span>
-        <div className="flex shrink-0 items-center gap-3">
-          {session.messages.some((m) => m.role === "assistant") && !pending && (
-            <button
-              type="button"
-              onClick={() => onRewindFiles(session.id)}
-              className="font-mono text-xs text-muted-foreground hover:text-foreground"
-              title="Restore files to their state before your last message"
-            >
-              ↺ Undo last turn
-            </button>
-          )}
-          {session.contextUsage !== undefined && (
-            <span className="font-mono text-xs text-muted-foreground" title={`${session.contextUsage.totalTokens.toLocaleString()} / ${session.contextUsage.maxTokens.toLocaleString()} tokens`}>
-              {Math.round(session.contextUsage.percentage)}% context
-            </span>
-          )}
-          {session.totalCostUsd !== undefined && (
-            <span className="font-mono text-xs text-muted-foreground" title={`${session.totalInputTokens ?? 0} in / ${session.totalOutputTokens ?? 0} out tokens`}>
-              ${session.totalCostUsd.toFixed(4)}
-            </span>
-          )}
-        </div>
       </div>
       {rewindResult && (
         <div className="shrink-0 border-b border-border px-4 py-1.5 font-mono text-xs text-muted-foreground">
@@ -1304,11 +1835,30 @@ function ChatWindow({
               {toolProgress && toolProgress.length > 0 && (
                 <div className="mb-1 space-y-0.5">
                   {toolProgress.map((t) => (
-                    <ToolCallLine key={t.id} call={t} />
+                    <div key={t.id} className="flex items-center gap-1">
+                      <div className="min-w-0 flex-1">
+                        <ToolCallLine call={t} />
+                      </div>
+                      {!t.result && (
+                        <button
+                          type="button"
+                          onClick={() => onBackgroundTask(session.id, t.id)}
+                          className="shrink-0 font-mono text-xs text-muted-foreground hover:text-foreground"
+                          title="Move this to the background and keep going"
+                        >
+                          background
+                        </button>
+                      )}
+                    </div>
                   ))}
                 </div>
               )}
-              {permissionRequest ? (
+              {elicitationRequest ? (
+                <ElicitationCard
+                  request={elicitationRequest}
+                  onRespond={(action, content) => onRespondToElicitation(session.id, elicitationRequest.requestId, action, content)}
+                />
+              ) : permissionRequest ? (
                 <div className="max-w-md rounded-md border border-primary/40 bg-muted p-2">
                   <p className="text-sm">
                     {permissionRequest.title ?? `Allow ${permissionRequest.toolName}?`}
@@ -1334,7 +1884,7 @@ function ChatWindow({
                   </div>
                 </div>
               ) : streamingText ? (
-                <p className="whitespace-pre-wrap break-words text-sm">{streamingText}</p>
+                <Markdown text={streamingText} className="text-sm" />
               ) : !toolProgress || toolProgress.length === 0 ? (
                 <p className="text-sm text-muted-foreground">thinking...</p>
               ) : null}
@@ -1421,15 +1971,35 @@ function ChatWindow({
 
           <div className="mt-1 flex items-center justify-between gap-2">
             <div className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                disabled={pending}
-                title="Attach image or PDF"
-                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
-              >
-                <PlusIcon />
-              </button>
+              <WorkspaceMenu
+                workspace={workspace}
+                session={session}
+                open={composerOpen}
+                panel={composerPanel}
+                onOpenChange={setComposerOpen}
+                onPanelChange={setComposerPanel}
+                onAttach={() => fileInputRef.current?.click()}
+                onRewindFiles={onRewindFiles}
+                pending={pending}
+                onAddPlugin={onAddPlugin}
+                onRemovePlugin={onRemovePlugin}
+                onUpdateTools={onUpdateTools}
+                onUpdateSandbox={onUpdateSandbox}
+                onAddDirectory={onAddDirectory}
+                onRemoveDirectory={onRemoveDirectory}
+                onAddAgent={onAddAgent}
+                onRemoveAgent={onRemoveAgent}
+                onUpdateFallbackModel={onUpdateFallbackModel}
+                onUpdateSystemPrompt={onUpdateSystemPrompt}
+                onAddMcpServer={onAddMcpServer}
+                onRemoveMcpServer={onRemoveMcpServer}
+                onGetMcpStatus={onGetMcpStatus}
+                mcpStatus={mcpStatus}
+              />
+
+              {session.contextUsage !== undefined && (
+                <ContextRing percentage={session.contextUsage.percentage} onClick={runCompact} />
+              )}
 
               <Dropdown
                 trigger={

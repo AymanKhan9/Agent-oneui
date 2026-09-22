@@ -1,15 +1,16 @@
 import { WebSocket } from "ws";
 import {
-    AddDirectorySchema, AddMcpServerSchema, AddMessageSchema, AddPluginSchema, CreateSessionSchema, CreateWorkspaceSchema,
-    InterruptSchema, ListFilesSchema, PermissionResponseSchema, RemoveDirectorySchema, RemoveMcpServerSchema, RemovePluginSchema,
-    GetMcpStatusSchema, RewindFilesSchema, UpdateSandboxSchema, UpdateToolsSchema, ToolOptions,
-    type AttachmentSchemaType, type IncomingMessageType, type McpServerConfigType, type OutgoingMessageType
+    AddAgentSchema, AddDirectorySchema, AddMcpServerSchema, AddMessageSchema, AddPluginSchema, BackgroundTaskSchema,
+    CreateSessionSchema, CreateWorkspaceSchema, ElicitationResponseSchema,
+    InterruptSchema, PermissionResponseSchema, RemoveAgentSchema, RemoveDirectorySchema, RemoveMcpServerSchema, RemovePluginSchema,
+    GetMcpStatusSchema, GetUsageSchema, RewindFilesSchema, UpdateFallbackModelSchema, UpdateSandboxSchema, UpdateSystemPromptSchema, UpdateToolsSchema, ToolOptions,
+    type AddMessageSchemaType, type AgentDefinitionSchemaType, type AttachmentSchemaType, type IncomingMessageType, type McpServerConfigType, type OutgoingMessageType
 } from "commons/types";
 import { SessionModel, WorkspaceModel } from "db/client";
 import { query, type PermissionMode, type PermissionResult, type Query } from "@anthropic-ai/claude-agent-sdk";
 import mongoose from "mongoose";
-import { existsSync, statSync, readdirSync } from "node:fs";
-import { isAbsolute, join, relative } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { isAbsolute } from "node:path";
 
 const DEFAULT_ENABLED_TOOLS = ["Read", "Edit", "Write", "Glob", "Bash"];
 
@@ -91,20 +92,32 @@ function buildMcpServers(servers?: McpServerConfigType[]) {
     return out;
 }
 
-// Tools/plugins/MCP servers/sandboxing/extra dirs/turn+budget caps are only
-// configurable at process-start time (no live "setTools" control request
-// exists) — this fingerprint tells us when a session's runtime is stale and
-// needs to be torn down and recreated (via `resume`) instead of just
-// streaming the next message into it.
+// {name,description,prompt,model,tools}[] -> the Record<name, AgentDefinition> shape the SDK wants
+function buildAgents(agents?: AgentDefinitionSchemaType[]) {
+    if (!agents || agents.length === 0) return undefined;
+    const out: Record<string, any> = {};
+    for (const a of agents) {
+        out[a.name] = { description: a.description, prompt: a.prompt, model: a.model, tools: a.tools };
+    }
+    return out;
+}
+
+// Tools/plugins/MCP servers/sandboxing/extra dirs/turn+budget caps/agents/
+// fallback model/system prompt are only configurable at process-start time
+// (no live "setTools" control request exists) — this fingerprint tells us
+// when a session's runtime is stale and needs to be torn down and recreated
+// (via `resume`) instead of just streaming the next message into it.
 function configFingerprint(config: {
     enabledTools: string[]; pluginPaths: string[] | undefined; mcpServers: unknown;
     sandboxed: boolean | undefined; additionalDirectories: string[] | undefined;
     maxTurns: number | undefined; maxBudgetUsd: number | undefined;
+    agents: unknown; fallbackModel: string | undefined; systemPromptAppend: string | undefined;
 }) {
     return JSON.stringify({
         enabledTools: config.enabledTools, pluginPaths: config.pluginPaths ?? [], mcpServers: config.mcpServers ?? [],
         sandboxed: config.sandboxed ?? false, additionalDirectories: config.additionalDirectories ?? [],
         maxTurns: config.maxTurns ?? null, maxBudgetUsd: config.maxBudgetUsd ?? null,
+        agents: config.agents ?? [], fallbackModel: config.fallbackModel ?? null, systemPromptAppend: config.systemPromptAppend ?? null,
     });
 }
 
@@ -150,6 +163,9 @@ export class User {
     // requestId -> resolver, for tool calls awaiting a live permission decision
     // ("default"/ask permission mode only — every other mode auto-allows in canUseTool below)
     private pendingPermissions = new Map<string, (result: PermissionResult) => void>();
+    // requestId -> resolver, for MCP elicitation requests (form input / OAuth
+    // URL flows) awaiting a live response from the client
+    private pendingElicitations = new Map<string, (result: any) => void>();
     // sessionId -> this connection's live subprocess for that session
     private sessionRuntimes = new Map<string, SessionRuntime>();
     // sessionId -> the turn currently in flight on that session (one at a time,
@@ -162,6 +178,17 @@ export class User {
     // late/aborted results instead of matching them to the wrong turn.
     private turnQueues = new Map<string, TurnState[]>();
     private staleResultsExpected = new Map<string, number>();
+    // sessionId -> the tail of that session's add-message chain. Two
+    // add-message calls for the same session can otherwise run concurrently
+    // (ws 'message' events aren't serialized — a second call can arrive
+    // before the first's turnPromise settles, e.g. because the frontend
+    // re-enables its composer on "assistant-message", which fires before the
+    // later "message-added" that actually finishes this class's own turn
+    // bookkeeping) and race on the shared sessionRuntimes/turnQueues maps,
+    // corrupting the queue and leaving a turn hung forever. Chaining every
+    // add-message for a session onto this promise forces them to run one at
+    // a time, in arrival order, regardless of client timing.
+    private sessionLocks = new Map<string, Promise<unknown>>();
 
     constructor(id:string, socket: WebSocket){
         this.socket = socket
@@ -234,6 +261,16 @@ export class User {
                     const assistantPayload = { message: message.content, toolCalls: [] as ToolCallState[] };
                     this.sendMessage({ type: "assistant-message", payload: assistantPayload })
                     await SessionModel.updateOne({ _id: sessionId },{$push:{conversation:{role:"assistant",payload:assistantPayload}}})
+                } else if (message.type === "system" && message.subtype === "task_notification") {
+                    // a backgrounded Bash/subagent task (Query.backgroundTasks()) settling
+                    // outside the normal turn flow — the turn that started it has already
+                    // returned, so this is reported as its own system note
+                    this.sendMessage({
+                        type: "task-notification",
+                        payload: { sessionId, taskId: message.task_id, status: message.status, summary: message.summary }
+                    })
+                    const text = `Background task ${message.status}: ${message.summary}`;
+                    await SessionModel.updateOne({ _id: sessionId }, { $push: { conversation: { role: "system", payload: { text } } } })
                 } else if (message.type === "assistant" && message.message?.content) {
                     if (!turn) continue;
                     for (const block of message.message.content) {
@@ -507,6 +544,118 @@ export class User {
             }
         }
 
+        if(msg.type === "add-agent"){
+            const {success,data} = AddAgentSchema.safeParse(msg.payload);
+            if(!success){
+                throw new Error("Incorrect agent schema")
+            }
+
+            const workspace = await WorkspaceModel.findById(data.workspaceId)
+            if(!workspace){
+                throw new Error("Workspace not found")
+            }
+
+            const agents = ((workspace.agents as unknown as AgentDefinitionSchemaType[]) ?? []).filter(a => a.name !== data.agent.name)
+            agents.push(data.agent)
+            workspace.agents = agents as any
+            await workspace.save()
+
+            return {
+                type: "agents-updated",
+                payload: { workspaceId: data.workspaceId, agents: agents as AgentDefinitionSchemaType[] }
+            }
+        }
+
+        if(msg.type === "remove-agent"){
+            const {success,data} = RemoveAgentSchema.safeParse(msg.payload);
+            if(!success){
+                throw new Error("Incorrect agent schema")
+            }
+
+            const workspace = await WorkspaceModel.findById(data.workspaceId)
+            if(!workspace){
+                throw new Error("Workspace not found")
+            }
+
+            const agents = ((workspace.agents as unknown as AgentDefinitionSchemaType[]) ?? []).filter(a => a.name !== data.name)
+            workspace.agents = agents as any
+            await workspace.save()
+
+            return {
+                type: "agents-updated",
+                payload: { workspaceId: data.workspaceId, agents: agents as AgentDefinitionSchemaType[] }
+            }
+        }
+
+        if(msg.type === "update-fallback-model"){
+            const {success,data} = UpdateFallbackModelSchema.safeParse(msg.payload);
+            if(!success){
+                throw new Error("Incorrect fallback-model schema")
+            }
+
+            const workspace = await WorkspaceModel.findById(data.workspaceId)
+            if(!workspace){
+                throw new Error("Workspace not found")
+            }
+
+            workspace.fallbackModel = data.fallbackModel
+            await workspace.save()
+
+            return {
+                type: "fallback-model-updated",
+                payload: { workspaceId: data.workspaceId, fallbackModel: data.fallbackModel }
+            }
+        }
+
+        if(msg.type === "update-system-prompt"){
+            const {success,data} = UpdateSystemPromptSchema.safeParse(msg.payload);
+            if(!success){
+                throw new Error("Incorrect system-prompt schema")
+            }
+
+            const workspace = await WorkspaceModel.findById(data.workspaceId)
+            if(!workspace){
+                throw new Error("Workspace not found")
+            }
+
+            workspace.systemPromptAppend = data.systemPromptAppend
+            await workspace.save()
+
+            return {
+                type: "system-prompt-updated",
+                payload: { workspaceId: data.workspaceId, systemPromptAppend: data.systemPromptAppend }
+            }
+        }
+
+        if(msg.type === "background-task"){
+            const {success,data} = BackgroundTaskSchema.safeParse(msg.payload);
+            if(!success){
+                throw new Error("Incorrect background-task schema")
+            }
+
+            const runtime = this.sessionRuntimes.get(data.sessionId);
+            if(runtime){
+                await runtime.query.backgroundTasks(data.toolUseId);
+            }
+
+            return undefined
+        }
+
+        if(msg.type === "elicitation-response"){
+            const {success,data} = ElicitationResponseSchema.safeParse(msg.payload);
+            if(!success){
+                throw new Error("Incorrect elicitation-response schema")
+            }
+
+            const resolve = this.pendingElicitations.get(data.requestId);
+            if(resolve){
+                this.pendingElicitations.delete(data.requestId);
+                resolve({ action: data.action, content: data.content });
+            }
+
+            return undefined
+        }
+
         if(msg.type === "add-mcp-server"){
             const {success,data} = AddMcpServerSchema.safeParse(msg.payload);
             if(!success){
@@ -553,38 +702,6 @@ export class User {
             return {
                 type: "mcp-servers-updated",
                 payload: { workspaceId: data.workspaceId, mcpServers: mcpServers as McpServerConfigType[] }
-            }
-        }
-
-        if(msg.type === "list-files"){
-            const {success,data} = ListFilesSchema.safeParse(msg.payload);
-            if(!success){
-                throw new Error("Incorrect list-files schema")
-            }
-
-            const workspace = await WorkspaceModel.findById(data.workspaceId)
-            if(!workspace || !workspace.path){
-                throw new Error("Workspace not found")
-            }
-
-            const subpath = data.subpath ?? "";
-            const dir = join(workspace.path, subpath);
-            // stay inside the workspace: resolve, then confirm it didn't escape via ../
-            if(relative(workspace.path, dir).startsWith("..")){
-                throw new Error("Path escapes the workspace")
-            }
-            if(!existsSync(dir) || !statSync(dir).isDirectory()){
-                throw new Error(`Not a directory: ${dir}`)
-            }
-
-            const entries = readdirSync(dir, { withFileTypes: true })
-                .filter(e => !e.name.startsWith("."))
-                .map(e => ({ name: e.name, type: (e.isDirectory() ? "dir" : "file") as "dir" | "file" }))
-                .sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1))
-
-            return {
-                type: "files-listed",
-                payload: { workspaceId: data.workspaceId, subpath, entries }
             }
         }
 
@@ -674,12 +791,63 @@ export class User {
             }
         }
 
+        if(msg.type === "get-usage"){
+            const {success,data} = GetUsageSchema.safeParse(msg.payload);
+            if(!success){
+                throw new Error("Incorrect get-usage schema")
+            }
+
+            const runtime = this.sessionRuntimes.get(data.sessionId);
+            if(!runtime){
+                return { type: "usage-info", payload: { sessionId: data.sessionId, error: "Send a message first" } }
+            }
+
+            // usage_EXPERIMENTAL_... is explicitly unstable per the SDK's own
+            // naming — this is the only source for the plan rate-limit windows
+            // (5hr/7day) the real /usage dialog shows, so we accept that risk
+            const [account, usage] = await Promise.all([
+                runtime.query.accountInfo().catch(() => undefined),
+                runtime.query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET().catch(() => undefined)
+            ]);
+
+            return {
+                type: "usage-info",
+                payload: {
+                    sessionId: data.sessionId,
+                    account: account ? {
+                        email: account.email, organization: account.organization,
+                        subscriptionType: account.subscriptionType, tokenSource: account.tokenSource
+                    } : undefined,
+                    totalCostUsd: usage?.session.total_cost_usd,
+                    fiveHour: usage?.rate_limits?.five_hour
+                        ? { utilization: usage.rate_limits.five_hour.utilization, resetsAt: usage.rate_limits.five_hour.resets_at }
+                        : undefined,
+                    sevenDay: usage?.rate_limits?.seven_day
+                        ? { utilization: usage.rate_limits.seven_day.utilization, resetsAt: usage.rate_limits.seven_day.resets_at }
+                        : undefined
+                }
+            }
+        }
+
         if(msg.type === "add-message"){
             const {success,data} = AddMessageSchema.safeParse(msg.payload);
             if(!success){
                 throw new Error("Incorrect message schema")
             }
 
+            const prior = this.sessionLocks.get(data.sessionId) ?? Promise.resolve();
+            const thisTurn = prior.then(
+                () => this.processAddMessage(data),
+                () => this.processAddMessage(data)
+            );
+            this.sessionLocks.set(data.sessionId, thisTurn.catch(() => undefined));
+            return thisTurn;
+        }
+
+        throw new Error("Unhandled message type")
+    }
+
+    private async processAddMessage(data: AddMessageSchemaType): Promise<OutgoingMessageType> {
             const session = await SessionModel.findById(new mongoose.Types.ObjectId(data.sessionId))
 
             if(!session){
@@ -719,7 +887,9 @@ export class User {
             const fingerprint = configFingerprint({
                 enabledTools, pluginPaths: workspace?.pluginPaths, mcpServers: workspace?.mcpServers,
                 sandboxed: workspace?.sandboxed ?? undefined, additionalDirectories: workspace?.additionalDirectories,
-                maxTurns, maxBudgetUsd
+                maxTurns, maxBudgetUsd,
+                agents: workspace?.agents, fallbackModel: workspace?.fallbackModel ?? undefined,
+                systemPromptAppend: workspace?.systemPromptAppend ?? undefined
             });
 
             let runtime = this.sessionRuntimes.get(data.sessionId);
@@ -772,6 +942,11 @@ export class User {
                         sandbox: workspace?.sandboxed
                             ? { enabled: true, autoAllowBashIfSandboxed: true, failIfUnavailable: false }
                             : undefined,
+                        agents: buildAgents(workspace?.agents as AgentDefinitionSchemaType[] | undefined),
+                        fallbackModel: workspace?.fallbackModel || undefined,
+                        systemPrompt: workspace?.systemPromptAppend
+                            ? { type: "preset" as const, preset: "claude_code" as const, append: workspace.systemPromptAppend }
+                            : undefined,
                         canUseTool: async (toolName, input, opts) => {
                             if (liveState.permissionMode !== "default") return { behavior: "allow" };
                             const requestId = crypto.randomUUID();
@@ -782,14 +957,43 @@ export class User {
                             return new Promise<PermissionResult>(resolve => {
                                 this.pendingPermissions.set(requestId, resolve);
                             });
-                        }
+                        },
+                        // MCP servers occasionally need user input mid-run (OAuth links, form
+                        // fields) — url mode just needs an ack so the browser flow can proceed,
+                        // form mode gets a real round trip to the client
+                        onElicitation: async (request, opts) => {
+                            if (request.mode === "url") {
+                                this.sendMessage({
+                                    type: "elicitation-request",
+                                    payload: {
+                                        sessionId: data.sessionId, requestId: opts.requestId, serverName: request.serverName,
+                                        message: request.message, mode: "url", url: request.url, title: request.title
+                                    }
+                                })
+                                return { action: "accept" };
+                            }
+                            this.sendMessage({
+                                type: "elicitation-request",
+                                payload: {
+                                    sessionId: data.sessionId, requestId: opts.requestId, serverName: request.serverName,
+                                    message: request.message, mode: request.mode, requestedSchema: request.requestedSchema, title: request.title
+                                }
+                            })
+                            return new Promise(resolve => {
+                                this.pendingElicitations.set(opts.requestId, resolve);
+                            });
+                        },
+                        // unknown/unsupported dialog kinds decline immediately instead of
+                        // hanging until the worker's park deadline — no bespoke UI exists
+                        // for arbitrary CLI dialogs yet
+                        onUserDialog: async () => ({ behavior: "cancelled" })
                     }
                 });
 
                 runtime = { query: queryObj, push, fingerprint, model, liveState };
                 this.sessionRuntimes.set(data.sessionId, runtime);
                 this.consumeSession(data.sessionId, queryObj); // persistent background loop, outlives this call
-                runtime.lastUserMessageUuid = runtime.push(msg.payload.message, data.attachments);
+                runtime.lastUserMessageUuid = runtime.push(data.message, data.attachments);
             } else {
                 if (runtime.liveState.permissionMode !== permissionMode) {
                     await runtime.query.setPermissionMode(permissionMode);
@@ -799,12 +1003,9 @@ export class User {
                     await runtime.query.setModel(model);
                     runtime.model = model;
                 }
-                runtime.lastUserMessageUuid = runtime.push(msg.payload.message, data.attachments);
+                runtime.lastUserMessageUuid = runtime.push(data.message, data.attachments);
             }
 
             return await turnPromise;
-        }
-
-        throw new Error("Unhandled message type")
     }
 }

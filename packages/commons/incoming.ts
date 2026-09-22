@@ -92,13 +92,6 @@ export const RemoveMcpServerSchema = z.object({
 
 export type RemoveMcpServerSchemaType = z.infer<typeof RemoveMcpServerSchema>
 
-export const ListFilesSchema = z.object({
-    workspaceId: z.string(),
-    subpath: z.string().optional()
-})
-
-export type ListFilesSchemaType = z.infer<typeof ListFilesSchema>
-
 export const InterruptSchema = z.object({
     sessionId: z.string()
 })
@@ -125,6 +118,12 @@ export const GetMcpStatusSchema = z.object({
 
 export type GetMcpStatusSchemaType = z.infer<typeof GetMcpStatusSchema>
 
+export const GetUsageSchema = z.object({
+    sessionId: z.string()
+})
+
+export type GetUsageSchemaType = z.infer<typeof GetUsageSchema>
+
 export const UpdateSandboxSchema = z.object({
     workspaceId: z.string(),
     sandboxed: z.boolean()
@@ -146,6 +145,60 @@ export const RemoveDirectorySchema = z.object({
 
 export type RemoveDirectorySchemaType = z.infer<typeof RemoveDirectorySchema>
 
+// scoped down from the SDK's full AgentDefinition — see packages/db/index.ts
+export const AgentDefinitionSchema = z.object({
+    name: z.string(),
+    description: z.string(),
+    prompt: z.string(),
+    model: z.string().optional(),
+    tools: z.array(z.string()).optional()
+})
+
+export type AgentDefinitionSchemaType = z.infer<typeof AgentDefinitionSchema>
+
+export const AddAgentSchema = z.object({
+    workspaceId: z.string(),
+    agent: AgentDefinitionSchema
+})
+
+export type AddAgentSchemaType = z.infer<typeof AddAgentSchema>
+
+export const RemoveAgentSchema = z.object({
+    workspaceId: z.string(),
+    name: z.string()
+})
+
+export type RemoveAgentSchemaType = z.infer<typeof RemoveAgentSchema>
+
+export const UpdateFallbackModelSchema = z.object({
+    workspaceId: z.string(),
+    fallbackModel: z.string()
+})
+
+export type UpdateFallbackModelSchemaType = z.infer<typeof UpdateFallbackModelSchema>
+
+export const UpdateSystemPromptSchema = z.object({
+    workspaceId: z.string(),
+    systemPromptAppend: z.string()
+})
+
+export type UpdateSystemPromptSchemaType = z.infer<typeof UpdateSystemPromptSchema>
+
+export const BackgroundTaskSchema = z.object({
+    sessionId: z.string(),
+    toolUseId: z.string().optional()
+})
+
+export type BackgroundTaskSchemaType = z.infer<typeof BackgroundTaskSchema>
+
+export const ElicitationResponseSchema = z.object({
+    requestId: z.string(),
+    action: z.enum(["accept", "decline", "cancel"]),
+    content: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional()
+})
+
+export type ElicitationResponseSchemaType = z.infer<typeof ElicitationResponseSchema>
+
 export type IncomingMessageType = {
     type: "create-workspace",
     payload: CreateWorkspaceSchemaType
@@ -156,11 +209,17 @@ export type IncomingMessageType = {
   | {type:"update-tools",payload: UpdateToolsSchemaType}
   | {type:"add-mcp-server",payload: AddMcpServerSchemaType}
   | {type:"remove-mcp-server",payload: RemoveMcpServerSchemaType}
-  | {type:"list-files",payload: ListFilesSchemaType}
   | {type:"interrupt",payload: InterruptSchemaType}
   | {type:"permission-response",payload: PermissionResponseSchemaType}
   | {type:"rewind-files",payload: RewindFilesSchemaType}
   | {type:"get-mcp-status",payload: GetMcpStatusSchemaType}
+  | {type:"get-usage",payload: GetUsageSchemaType}
   | {type:"update-sandbox",payload: UpdateSandboxSchemaType}
   | {type:"add-directory",payload: AddDirectorySchemaType}
   | {type:"remove-directory",payload: RemoveDirectorySchemaType}
+  | {type:"add-agent",payload: AddAgentSchemaType}
+  | {type:"remove-agent",payload: RemoveAgentSchemaType}
+  | {type:"update-fallback-model",payload: UpdateFallbackModelSchemaType}
+  | {type:"update-system-prompt",payload: UpdateSystemPromptSchemaType}
+  | {type:"background-task",payload: BackgroundTaskSchemaType}
+  | {type:"elicitation-response",payload: ElicitationResponseSchemaType}

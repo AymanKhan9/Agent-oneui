@@ -1,7 +1,7 @@
 import { WebSocket } from "ws";
 import { User } from "./User";
 import { WorkspaceModel, SessionModel } from "db/client";
-import type { McpServerConfig, Session, Workspace } from "commons/types";
+import type { AgentDefinition, McpServerConfig, Session, Workspace } from "commons/types";
 
 
 
@@ -60,6 +60,9 @@ export class UserManager{
                 mcpServers: (w.mcpServers as unknown as McpServerConfig[]) ?? undefined,
                 sandboxed: w.sandboxed ?? undefined,
                 additionalDirectories: w.additionalDirectories ?? undefined,
+                agents: (w.agents as unknown as AgentDefinition[]) ?? undefined,
+                fallbackModel: w.fallbackModel ?? undefined,
+                systemPromptAppend: w.systemPromptAppend ?? undefined,
                 sessions:finalSessions
             })
         })

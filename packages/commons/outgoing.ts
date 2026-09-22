@@ -95,9 +95,25 @@ export type RewindResultSchemaType = z.infer<typeof RewindResultSchema>
 
 export type McpServerConfig = { name: string; type: "http" | "sse" | "stdio"; url?: string; command?: string; args?: string[] }
 
-export type FileEntry = { name: string; type: "file" | "dir" }
-
 export type McpStatusEntry = { name: string; status: "connected" | "failed" | "needs-auth" | "pending" | "disabled"; error?: string; toolCount?: number }
+
+export type AgentDefinition = { name: string; description: string; prompt: string; model?: string; tools?: string[] }
+
+export type ElicitationRequestPayload = {
+    sessionId: string; requestId: string; serverName: string; message: string;
+    mode?: "form" | "url"; url?: string; requestedSchema?: Record<string, unknown>; title?: string;
+}
+
+export type UsageWindow = { utilization: number | null; resetsAt: string | null }
+
+export type UsageInfoPayload = {
+    sessionId: string;
+    error?: string;
+    account?: { email?: string; organization?: string; subscriptionType?: string; tokenSource?: string };
+    totalCostUsd?: number;
+    fiveHour?: UsageWindow;
+    sevenDay?: UsageWindow;
+}
 
 export type OutgoingMessageType = {
     type: "workspace-created",
@@ -112,13 +128,18 @@ export type OutgoingMessageType = {
   | {type:"plugin-paths-updated",payload: PluginPathsUpdatedType}
   | {type:"tools-updated",payload:{workspaceId:string, enabledTools:string[]}}
   | {type:"mcp-servers-updated",payload:{workspaceId:string, mcpServers: McpServerConfig[]}}
-  | {type:"files-listed",payload:{workspaceId:string, subpath:string, entries: FileEntry[]}}
   | {type:"permission-request",payload:{sessionId:string, requestId:string, toolName:string, input:unknown, title?:string}}
   | {type:"compaction",payload: CompactionSchemaType}
   | {type:"rewind-result",payload: RewindResultSchemaType}
   | {type:"mcp-status",payload:{sessionId:string, servers: McpStatusEntry[]}}
   | {type:"sandbox-updated",payload:{workspaceId:string, sandboxed:boolean}}
-  | {type:"directories-updated",payload:{workspaceId:string, additionalDirectories:string[]}} |
+  | {type:"directories-updated",payload:{workspaceId:string, additionalDirectories:string[]}}
+  | {type:"agents-updated",payload:{workspaceId:string, agents: AgentDefinition[]}}
+  | {type:"fallback-model-updated",payload:{workspaceId:string, fallbackModel:string}}
+  | {type:"system-prompt-updated",payload:{workspaceId:string, systemPromptAppend:string}}
+  | {type:"elicitation-request",payload: ElicitationRequestPayload}
+  | {type:"task-notification",payload:{sessionId:string, taskId:string, status:"completed"|"failed"|"stopped", summary:string}}
+  | {type:"usage-info",payload: UsageInfoPayload} |
 {
     type:"init",
     workspaces: Workspace []
@@ -134,6 +155,9 @@ export type Workspace ={
     mcpServers?: McpServerConfig[],
     sandboxed?: boolean,
     additionalDirectories?: string[],
+    agents?: AgentDefinition[],
+    fallbackModel?: string,
+    systemPromptAppend?: string,
     sessions: Session[]
 }
 

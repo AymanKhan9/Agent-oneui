@@ -9,6 +9,14 @@ const McpServerSchema = new mongoose.Schema(
     { _id: false }
 )
 
+// scoped down from the SDK's full AgentDefinition (skills/mcpServers/memory/
+// effort/permissionMode/observer/etc.) to the fields worth hand-authoring
+// from a UI; everything else stays a CLAUDE.md/.claude/agents/*.md concern
+const AgentDefinitionSchema = new mongoose.Schema(
+    { name: String, description: String, prompt: String, model: String, tools: [String] },
+    { _id: false }
+)
+
 export const Workspace = new mongoose.Schema({
     path:String,
     name:String,
@@ -16,7 +24,10 @@ export const Workspace = new mongoose.Schema({
     enabledTools: [String],
     mcpServers: [McpServerSchema],
     sandboxed: Boolean,
-    additionalDirectories: [String]
+    additionalDirectories: [String],
+    agents: [AgentDefinitionSchema],
+    fallbackModel: String,
+    systemPromptAppend: String
 
 })
 
